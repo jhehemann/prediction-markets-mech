@@ -40,6 +40,9 @@ from dateutil import parser
 from tqdm import tqdm
 from sklearn.metrics.pairwise import cosine_similarity
 from langchain.embeddings.spacy_embeddings import SpacyEmbeddings
+from langchain.embeddings import HuggingFaceEmbeddings
+from langchain.embeddings import TensorflowHubEmbeddings
+
 
 NUM_URLS_EXTRACT = 5
 MAX_TOTAL_TOKENS_CHAT_COMPLETION = 4096 # Set the limit for cost efficiency
@@ -132,6 +135,32 @@ OUTPUT_FORMAT:
    - "queries": A 1-5 item array of the generated search engine queries.
 * Include only the JSON object in your output.
 """
+
+ALT_EVENT_QUESTION_PROMPT = """
+You are a Large Language Model in a multi-agent system. Your task is to rephrase a user's 'event question', \
+which specifies an event and any accompanying conditions. Find the 'event question' under 'USER_PROMPT' \
+and adhere to the 'INSTRUCTIONS'.
+
+INSTRUCTIONS:
+* Carefully read the 'event question' under 'USER_PROMPT', enclosed by triple backticks.
+* Create a list of two unique rephrased formulations for the event question.
+* It is very important that each alternative must not change the meaning of the original event question.
+* Each alternative must contain words that are not present in the event question or the generated alternatives.
+* You must provide your response in the format specified under "OUTPUT_FORMAT".
+* Do not include any other contents in your response.
+
+USER_PROMPT:
+```
+{event_question}
+```
+
+OUTPUT_FORMAT:
+* Your output response must be only a single JSON object to be parsed by Python's "json.loads()".
+* The JSON must contain only one field: "rephrased_questions".
+   - "rephrased_questions": A 2 item array of the generated alternative event questions.
+* Include only the JSON object in your output.
+"""
+
 
 # Global constants for possible attribute names for release and update dates
 RELEASE_DATE_NAMES = [
@@ -295,6 +324,47 @@ def truncate_additional_information(
     else:
         add_trunc_enc = add_enc[:-int(len_add_enc - max_add_tokens)]
         return enc.decode(add_trunc_enc)
+
+
+def rephrase_event_question(
+    event_question: str,
+    engine: str = "gpt-3.5-turbo",
+    temperature: float = 1.0,
+    max_compl_tokens: int = 200,
+) -> str:
+    """Rephrase an event question with different words."""
+        # Fetch queries from the OpenAI engine
+    
+    # Create URL query prompt
+    alt_event_question_prompt = ALT_EVENT_QUESTION_PROMPT.format(event_question=event_question)
+    
+    # Perform moderation check
+    moderation_result = openai.Moderation.create(alt_event_question_prompt)
+    if moderation_result["results"][0]["flagged"]:
+        return "Moderation flagged the prompt as in violation of terms.", None
+    
+    # Create messages for the OpenAI engine
+    messages = [
+        {"role": "system", "content": "You are a helpful assistant."},
+        {"role": "user", "content": alt_event_question_prompt},
+    ]
+
+    response = openai.ChatCompletion.create(
+        model=engine,
+        messages=messages,
+        temperature=temperature, # Override the default temperature parameter set for the engine
+        max_tokens=max_compl_tokens, # Override the default max_compl_tokens parameter set for the engine
+        n=1,
+        timeout=90,
+        request_timeout=90,
+        stop=None,
+    )
+
+    # Parse the response content
+    json_data = json.loads(response.choices[0].message.content)
+
+    return json_data["rephrased_questions"]
+
 
 
 def get_urls_from_queries(queries: List[str], api_key: str, engine: str, num: int = 3) -> List[str]:
@@ -477,7 +547,7 @@ def extract_relevant_information(
     text: str,
     query_emb,
     event_date: str,
-    model: SpacyEmbeddings,
+    model,
     nlp,
     max_words: int
 ) -> str:
@@ -939,8 +1009,7 @@ def run(**kwargs) -> Tuple[str, Optional[Dict[str, Any]]]:
 
     # Load the spacy model
     download_spacy_model("en_core_web_sm")
-    nlp = spacy.load("en_core_web_sm", exclude=["parser"])
-    nlp.enable_pipe("senter")
+    nlp = spacy.load("en_core_web_sm")
 
     # Get the LLM engine to be used
     engine = TOOL_TO_ENGINE[tool]
@@ -948,6 +1017,10 @@ def run(**kwargs) -> Tuple[str, Optional[Dict[str, Any]]]:
 
     # Extract the event question from the prompt
     event_question = re.search(r"\"(.+?)\"", prompt).group(1)
+    
+    # TODO: Pass it as parameters and calculate additional similarity scores
+    # event_question_rephrased = rephrase_event_question(event_question)
+    
     if not event_question:
         raise ValueError("No event question found in prompt.")
     print(f"EVENT_QUESTION: {event_question}")
